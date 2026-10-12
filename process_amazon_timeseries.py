@@ -80,6 +80,31 @@ POLICY_EVENTS = {
     2023: "Enforcement\nrestored",
 }
 
+# ---------------------------------------------------------------------------
+# NEW: Canopy openness / logging-road detection (structural fragmentation)
+# ---------------------------------------------------------------------------
+OUTPUT_CANOPY_DIR    = "output_canopy"
+OUTPUT_CANOPY_CSV    = "canopy_fragmentation_results.csv"
+OUTPUT_CANOPY_CHART  = "canopy_fragmentation_trend.png"
+
+CANOPY_BLUR_KERNEL        = (5, 5)
+CANOPY_CANNY_LOW          = 30     # lower = catches subtler edges
+CANOPY_CANNY_HIGH         = 100
+CANOPY_CLOSE_KERNEL       = (5, 5) # joins nearby edge pixels into solid shapes
+CANOPY_MIN_COMPONENT_PX   = 100    # drops tiny natural gaps / speckle
+CANOPY_FILL_HOLES_MAX_PX  = 1500   # fill closed edge loops smaller than this (round gaps)
+CANOPY_NORMALIZE_CONTRAST = True   # standardise forest texture contrast across years
+CANOPY_TARGET_SPREAD      = 10.0   # robust spread (gray levels) the forest is scaled to
+CANOPY_USE_FOREST_ROI     = True   # only analyse forest not yet in the cleared mask
+CANOPY_ROI_BUFFER_PX      = 3      # stay this far away from the cleared-area boundary
+CANOPY_LINEAR_ELONGATION  = 4.0    # length / width >= this => road- or trail-like
+CANOPY_MIN_ROAD_LENGTH_PX = 15     # 15 px = 450 m at 30 m/px
+CANOPY_EDGE_SATURATION    = 0.25   # warn if > 25% of forest pixels are edge pixels
+CANOPY_MIN_ROI_FRACTION   = 0.05   # skip a year if < 5% of the tile is analysable forest
+CANOPY_EXCLUDE_MASK_PATH  = None   # optional PNG, white = ignore (rivers, water, nodata)
+
+CANOPY_RESULTS: list[dict] = []
+
 
 @dataclass
 class YearResult:
@@ -247,6 +272,231 @@ def extract_frontier_and_fd(
 
 
 # ---------------------------------------------------------------------------
+# NEW: Canopy openness / logging-road detection (structural fragmentation)
+# ---------------------------------------------------------------------------
+
+def _canopy_roi(master_mask: np.ndarray) -> np.ndarray:
+    """255 = standing forest to analyse (outside the cumulative cleared mask + buffer)."""
+    if CANOPY_USE_FOREST_ROI:
+        k = 2 * CANOPY_ROI_BUFFER_PX + 1
+        cleared = cv2.dilate(master_mask, np.ones((k, k), np.uint8))
+        roi = cv2.bitwise_not(cleared)
+    else:
+        roi = np.full(master_mask.shape, 255, np.uint8)
+
+    if CANOPY_EXCLUDE_MASK_PATH:
+        ex = cv2.imread(CANOPY_EXCLUDE_MASK_PATH, cv2.IMREAD_GRAYSCALE)
+        if ex is not None and ex.shape == roi.shape:
+            roi[ex > 127] = 0
+        else:
+            log.warning("Canopy exclude mask unreadable or wrong shape — ignored.")
+    return roi
+
+
+def _normalize_gray(gray: np.ndarray, roi: np.ndarray) -> np.ndarray:
+    """Rescale so the forest's robust texture spread is the same in every year."""
+    g = gray.astype(np.float32)
+    sample = g[roi > 0] if np.count_nonzero(roi) > 1000 else g.ravel()
+    med = float(np.median(sample))
+    spread = max(float(np.median(np.abs(sample - med))) * 1.4826, 1.0)
+    out = (g - med) * (CANOPY_TARGET_SPREAD / spread) + 128.0
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _fill_small_holes(mask: np.ndarray) -> np.ndarray:
+    """Fill enclosed holes up to CANOPY_FILL_HOLES_MAX_PX so edge outlines of round gaps become solid."""
+    n, lab, st, _ = cv2.connectedComponentsWithStats(cv2.bitwise_not(mask), connectivity=4)
+    h, w = mask.shape
+    fill = np.zeros(n, bool)
+    for i in range(1, n):
+        x, y, bw, bh, area = (int(v) for v in st[i])
+        touches_border = x == 0 or y == 0 or x + bw >= w or y + bh >= h
+        fill[i] = (not touches_border) and area <= CANOPY_FILL_HOLES_MAX_PX
+    return np.where(fill[lab], 255, mask).astype(np.uint8)
+
+
+def detect_canopy_breaks(img: np.ndarray, roi: np.ndarray) -> dict:
+    """
+    Canny edges -> morphological closing -> fill small loops -> size filter, then split the surviving
+    components into road/trail-like (elongated) and opening-like (blobby) using the
+    distance transform: width ~ 2*max(DT)-1, length ~ area/width, elongation = length/width.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if CANOPY_NORMALIZE_CONTRAST:
+        gray = _normalize_gray(gray, roi)
+    blurred = cv2.GaussianBlur(gray, CANOPY_BLUR_KERNEL, 0)
+
+    edges = cv2.bitwise_and(cv2.Canny(blurred, CANOPY_CANNY_LOW, CANOPY_CANNY_HIGH), roi)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, CANOPY_CLOSE_KERNEL)
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+    closed = cv2.bitwise_and(_fill_small_holes(closed), roi)
+
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    keep = stats[:, cv2.CC_STAT_AREA] >= CANOPY_MIN_COMPONENT_PX
+    keep[0] = False  # label 0 is the background
+
+    roads = np.zeros_like(closed)
+    openings = np.zeros_like(closed)
+    road_length_px = 0.0
+    n_roads = n_openings = 0
+
+    for i in np.flatnonzero(keep):
+        x, y, w, h, area = (int(v) for v in stats[i])
+        crop = (labels[y:y + h, x:x + w] == i).astype(np.uint8)
+        padded = cv2.copyMakeBorder(crop, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+        width_px = max(2.0 * float(cv2.distanceTransform(padded, cv2.DIST_L2, 3).max()) - 1.0, 1.0)
+        length_px = area / width_px
+        elongation = length_px / width_px
+
+        if elongation >= CANOPY_LINEAR_ELONGATION and length_px >= CANOPY_MIN_ROAD_LENGTH_PX:
+            roads[y:y + h, x:x + w][crop == 1] = 255
+            road_length_px += length_px
+            n_roads += 1
+        else:
+            openings[y:y + h, x:x + w][crop == 1] = 255
+            n_openings += 1
+
+    return {
+        "edges": edges, "roads": roads, "openings": openings,
+        "road_length_px": road_length_px, "n_roads": n_roads, "n_openings": n_openings,
+    }
+
+
+def analyze_canopy_fragmentation(img: np.ndarray, master_mask: np.ndarray, year: int) -> dict:
+    """Run the canopy-break detector for one year, save images, return a metrics row."""
+    roi = _canopy_roi(master_mask)
+    roi_px = int(np.count_nonzero(roi))
+    roi_fraction = roi_px / roi.size
+    haze = float(np.mean(cv2.cvtColor(img, cv2.COLOR_BGR2HSV)[:, :, 1] < 30))  # low-saturation share
+
+    row = {
+        "year": year, "roi_fraction": roi_fraction, "edge_density": float("nan"),
+        "break_fraction_pct": float("nan"), "n_openings": 0, "opening_area_km2": float("nan"),
+        "n_linear": 0, "linear_length_km": float("nan"), "linear_density_km_per_km2": float("nan"),
+        "haze_low_sat_fraction": haze, "flag": "",
+    }
+
+    if roi_fraction < CANOPY_MIN_ROI_FRACTION:
+        row["flag"] = "roi_too_small"
+        log.info(f"  [{year}] Canopy analysis skipped: only {roi_fraction:.1%} of tile is analysable forest.")
+        return row
+
+    res = detect_canopy_breaks(img, roi)
+    roads, openings = res["roads"], res["openings"]
+    roi_km2 = roi_px * PIXEL_TO_KM2
+    break_px = int(np.count_nonzero(roads)) + int(np.count_nonzero(openings))
+    edge_density = int(np.count_nonzero(res["edges"])) / roi_px
+    road_km = res["road_length_px"] * METERS_PER_PIXEL / 1000.0
+
+    row.update({
+        "edge_density": edge_density,
+        "break_fraction_pct": 100.0 * break_px / roi_px,
+        "n_openings": res["n_openings"],
+        "opening_area_km2": int(np.count_nonzero(openings)) * PIXEL_TO_KM2,
+        "n_linear": res["n_roads"],
+        "linear_length_km": road_km,
+        "linear_density_km_per_km2": road_km / roi_km2,
+    })
+    if edge_density > CANOPY_EDGE_SATURATION:
+        row["flag"] = "edge_saturated"
+        log.warning(f"  [{year}] {edge_density:.0%} of forest pixels are edges — raise CANOPY_CANNY_LOW/HIGH.")
+
+    vis = img.copy()
+    vis[openings == 255] = [255, 255, 0]   # cyan   = canopy opening
+    vis[roads == 255] = [255, 0, 255]      # magenta = road / trail-like
+    cv2.imwrite(os.path.join(OUTPUT_CANOPY_DIR, f"canopy_{year}.png"),
+                cv2.addWeighted(img, 0.55, vis, 0.45, 0))
+    cv2.imwrite(os.path.join(OUTPUT_CANOPY_DIR, f"canopy_mask_{year}.png"),
+                np.maximum(roads, openings // 2))  # 255 = road-like, 127 = opening
+
+    log.info(
+        f"  [{year}] Canopy breaks: {row['break_fraction_pct']:.2f}% of forest | "
+        f"roads/trails: {res['n_roads']} ({road_km:,.1f} km) | openings: {res['n_openings']}"
+    )
+    return row
+
+
+def export_canopy_csv() -> None:
+    rows = sorted(CANOPY_RESULTS, key=lambda r: r["year"])
+    if not rows:
+        log.warning("No canopy results to export.")
+        return
+    cols = list(rows[0].keys())
+    with open(OUTPUT_CANOPY_CSV, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(cols)
+        for r in rows:
+            writer.writerow([
+                "" if isinstance(r[c], float) and np.isnan(r[c]) else
+                (f"{r[c]:.6f}" if isinstance(r[c], float) else r[c])
+                for c in cols
+            ])
+    log.info(f"Wrote canopy results to '{OUTPUT_CANOPY_CSV}'.")
+
+    ok = [r for r in rows if not np.isnan(r["break_fraction_pct"])]
+    brk_v = [r["break_fraction_pct"] for r in ok]
+    haze_v = [r["haze_low_sat_fraction"] for r in ok]
+    if len(ok) >= 5 and np.ptp(brk_v) > 0 and np.ptp(haze_v) > 0:
+        rho, p = sp_stats.spearmanr(brk_v, haze_v)
+        log.info(f"Canopy break fraction vs haze (low-saturation) fraction: Spearman rho={rho:.2f}, p={p:.3g}")
+        if abs(rho) > 0.5:
+            log.warning("  Canopy metrics track haze strongly — treat year-to-year changes with caution.")
+
+
+def plot_canopy_fragmentation() -> None:
+    rows = sorted(CANOPY_RESULTS, key=lambda r: r["year"])
+    ok = [r for r in rows if not np.isnan(r["break_fraction_pct"])]
+    if len(ok) < 2:
+        log.warning("Not enough canopy results to plot.")
+        return
+
+    yrs = np.array([r["year"] for r in ok])
+    brk = np.array([r["break_fraction_pct"] for r in ok])
+    road_density = np.array([r["linear_density_km_per_km2"] for r in ok])
+    opening_km2 = np.array([r["opening_area_km2"] for r in ok])
+    haze = np.array([r["haze_low_sat_fraction"] for r in ok]) * 100.0
+
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
+    fig.suptitle("Rondônia Canopy Structural Fragmentation (Prototype)",
+                 fontsize=14, weight="bold", y=0.98)
+
+    ax1.plot(yrs, brk, marker="o", color="#8e44ad", linewidth=2.0, markersize=5)
+    ax1.set_title("Canopy Breaks in Remaining Forest (roads, trails, openings)", fontsize=12, weight="bold")
+    ax1.set_ylabel("% of remaining forest", fontsize=11)
+
+    ax2.plot(yrs, road_density, marker="s", color="#d35400", linewidth=2.0, markersize=5,
+             label="Road/trail-like length density (km per km²)")
+    ax2.set_ylabel("km / km²", fontsize=11)
+    ax2b = ax2.twinx()
+    ax2b.plot(yrs, opening_km2, marker="^", color="#16a085", linewidth=1.6, markersize=5,
+              label="Canopy opening area (km²)")
+    ax2b.set_ylabel("km²", fontsize=11)
+    ax2.set_title("Road/Trail-like Features and Canopy Openings", fontsize=12, weight="bold")
+    h1, l1 = ax2.get_legend_handles_labels()
+    h2, l2 = ax2b.get_legend_handles_labels()
+    ax2.legend(h1 + h2, l1 + l2, fontsize=9, loc="upper left")
+
+    ax3.plot(yrs, haze, marker="o", color="#7f8c8d", linewidth=1.8, markersize=5)
+    ax3.set_title("Haze Proxy (share of low-saturation pixels) — check against panels above",
+                  fontsize=12, weight="bold")
+    ax3.set_ylabel("% of tile", fontsize=11)
+    ax3.set_xlabel("Year", fontsize=11)
+
+    for ax in (ax1, ax2, ax3):
+        ax.grid(True, linestyle="--", alpha=0.6)
+        for evt_year in POLICY_EVENTS:
+            if yrs.min() <= evt_year <= yrs.max():
+                ax.axvline(evt_year, color="#7f8c8d", linewidth=0.9, linestyle=":", alpha=0.7)
+    ax3.set_xticks(yrs[::2])
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(OUTPUT_CANOPY_CHART, dpi=300)
+    log.info(f"Saved canopy fragmentation chart to '{OUTPUT_CANOPY_CHART}'.")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Main processing loop
 # ---------------------------------------------------------------------------
 
@@ -254,6 +504,8 @@ def process_dataset() -> list[YearResult]:
     os.makedirs(OUTPUT_MASK_DIR, exist_ok=True)
     os.makedirs(OUTPUT_OVERLAY_DIR, exist_ok=True)
     os.makedirs(OUTPUT_FRONTIER_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_CANOPY_DIR, exist_ok=True)
+    CANOPY_RESULTS.clear()
 
     image_paths = sorted(glob.glob(os.path.join(DATASET_DIR, FILENAME_PATTERN)))
     log.info(f"Found {len(image_paths)} candidate images in '{DATASET_DIR}'.")
@@ -329,6 +581,12 @@ def process_dataset() -> list[YearResult]:
         frontier_edges = cv2.Canny(frontier, 50, 150)
         edge_vis = cv2.cvtColor(frontier_edges, cv2.COLOR_GRAY2BGR)
         cv2.imwrite(os.path.join(OUTPUT_FRONTIER_DIR, f"edges_{year}.png"), edge_vis)
+
+        # --- NEW: canopy openness / logging-road detection (structural fragmentation) ---
+        try:
+            CANOPY_RESULTS.append(analyze_canopy_fragmentation(img, master_mask, year))
+        except Exception as e:
+            log.warning(f"  [{year}] Canopy fragmentation analysis failed: {e}")
 
         results.append(YearResult(
             year=year,
@@ -525,6 +783,10 @@ def main() -> None:
     years_arr, areas_arr, annual_rate, fd_arr, r2_arr = compute_rates(results)
     export_csv(results, years_arr, annual_rate)
     plot_combined(years_arr, areas_arr, annual_rate, fd_arr, r2_arr)
+
+    # --- NEW: canopy fragmentation outputs ---
+    export_canopy_csv()
+    plot_canopy_fragmentation()
 
     # Summary statistics
     valid_fd = fd_arr[~np.isnan(fd_arr)]
